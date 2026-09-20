@@ -1,14 +1,24 @@
 import express from "express";
 import cors from "cors";
-import fs from "fs";
-import path from "path";
+import pg from "pg";
+
+const { Pool } = pg;
 
 const app = express();
 const PORT = process.env.PORT || 10000;
+const DATABASE_URL = process.env.DATABASE_URL;
 
-const DB = process.env.DATA_DIR
-  ? path.join(process.env.DATA_DIR, "data.json")
-  : "/tmp/capivara-radio-data.json";
+if (!DATABASE_URL) {
+  console.error("DATABASE_URL não configurada.");
+  process.exit(1);
+}
+
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: DATABASE_URL.includes("render.com")
+    ? { rejectUnauthorized: false }
+    : undefined
+});
 
 app.use(cors({
   origin: true,
@@ -18,357 +28,148 @@ app.use(cors({
 
 app.use(express.json({ limit: "25mb" }));
 
-
-// ============================================================
-// BANCO PROVISÓRIO
-// ============================================================
-
-const blank = () => ({
-  version: 1,
-  settings: {},
-  clients: {},
-  playlists: {},
-  jingles: {},
-  backgrounds: {},
-  updatedAt: new Date().toISOString()
-});
-
-function ensure() {
-  fs.mkdirSync(path.dirname(DB), { recursive: true });
-
-  if (!fs.existsSync(DB)) {
-    fs.writeFileSync(
-      DB,
-      JSON.stringify(blank(), null, 2)
-    );
-  }
+function blank() {
+  return {
+    version: 2,
+    settings: {},
+    clients: {},
+    playlists: {},
+    jingles: {},
+    backgrounds: {},
+    updatedAt: new Date().toISOString()
+  };
 }
 
-function read() {
-  ensure();
-
-  try {
-    return JSON.parse(
-      fs.readFileSync(DB, "utf8")
-    );
-  } catch {
-    return blank();
-  }
+function cleanCode(value) {
+  return String(value || "")
+    .trim()
+    .replace(/[^a-zA-Z0-9_-]/g, "");
 }
 
-function write(data) {
-  ensure();
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS capivara_store (
+      id SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+      data JSONB NOT NULL DEFAULT '{}'::jsonb,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
 
+  await pool.query(
+    `
+    INSERT INTO capivara_store (id, data)
+    VALUES (1, $1::jsonb)
+    ON CONFLICT (id) DO NOTHING
+    `,
+    [JSON.stringify(blank())]
+  );
+}
+
+async function readData() {
+  const result = await pool.query(
+    "SELECT data FROM capivara_store WHERE id = 1"
+  );
+
+  return result.rows[0]?.data || blank();
+}
+
+async function writeData(data) {
   data.updatedAt = new Date().toISOString();
 
-  fs.writeFileSync(
-    DB,
-    JSON.stringify(data, null, 2)
+  await pool.query(
+    `
+    UPDATE capivara_store
+    SET data = $1::jsonb,
+        updated_at = NOW()
+    WHERE id = 1
+    `,
+    [JSON.stringify(data)]
   );
 
   return data;
 }
 
-function code(value = "") {
-  return String(value || "")
-    .trim()
-    .replace(/\D/g, "")
-    .slice(-6);
-}
+function safe(fn) {
+  return async (req, res) => {
+    try {
+      await fn(req, res);
+    } catch (error) {
+      console.error(error);
 
-
-// ============================================================
-// CAPIVARA RADIO SERVER
-// ============================================================
-
-app.get("/", (req, res) => {
-  res.json({
-    ok: true,
-    service: "Capivara Radio Server",
-    version: "1.2.0"
-  });
-});
-
-
-// ============================================================
-// HEALTH
-// ============================================================
-
-app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    service: "Capivara Radio Server",
-    version: "1.2.0",
-    time: new Date().toISOString()
-  });
-});
-
-
-// ============================================================
-// STATUS DAS CONFIGURAÇÕES
-// NÃO EXPÕE CHAVES NEM IDs
-// ============================================================
-
-app.get("/api/environment-status", (req, res) => {
-  res.json({
-    ok: true,
-
-    gemini: {
-      keyConfigured: Boolean(
-        process.env.GEMINI_API_KEY
-      )
-    },
-
-    elevenlabs: {
-      keyConfigured: Boolean(
-        process.env.ELEVENLABS_API_KEY
-      ),
-
-      adMaleConfigured: Boolean(
-        process.env.ELEVENLABS_VOICE_MALE_ID
-      ),
-
-      adFemaleConfigured: Boolean(
-        process.env.ELEVENLABS_VOICE_FEMALE_ID
-      ),
-
-      jingleMaleConfigured: Boolean(
-        process.env.ELEVENLABS_JINGLE_MALE_ID
-      ),
-
-      jingleFemaleConfigured: Boolean(
-        process.env.ELEVENLABS_JINGLE_FEMALE_ID
-      )
-    }
-  });
-});
-
-
-// ============================================================
-// TESTE GEMINI + CONFIGURAÇÃO ELEVENLABS
-// ============================================================
-
-app.get("/api/test-apis", async (req, res) => {
-
-  const result = {
-    ok: true,
-
-    environment: {
-      geminiKey:
-        Boolean(process.env.GEMINI_API_KEY),
-
-      elevenLabsKey:
-        Boolean(process.env.ELEVENLABS_API_KEY),
-
-      adMale:
-        Boolean(process.env.ELEVENLABS_VOICE_MALE_ID),
-
-      adFemale:
-        Boolean(process.env.ELEVENLABS_VOICE_FEMALE_ID),
-
-      jingleMale:
-        Boolean(process.env.ELEVENLABS_JINGLE_MALE_ID),
-
-      jingleFemale:
-        Boolean(process.env.ELEVENLABS_JINGLE_FEMALE_ID)
-    },
-
-    gemini: {
-      ok: false,
-      status: null
-    },
-
-    elevenlabs: {
-      configured: false,
-      note: "Use /api/test-voice para testar geração real de áudio."
+      if (!res.headersSent) {
+        res.status(500).json({
+          ok: false,
+          error: "erro interno do servidor"
+        });
+      }
     }
   };
+}
 
+/* =========================================================
+   STATUS
+========================================================= */
 
-  // ----------------------------------------------------------
-  // TESTA A CHAVE GEMINI
-  // ----------------------------------------------------------
+app.get("/", safe(async (req, res) => {
+  res.json({
+    ok: true,
+    service: "Capivara Radio Server",
+    version: "2.0.0",
+    database: "postgres"
+  });
+}));
 
-  try {
-
-    if (!process.env.GEMINI_API_KEY) {
-      throw new Error(
-        "GEMINI_API_KEY não configurada"
-      );
-    }
-
-    const url =
-      "https://generativelanguage.googleapis.com/v1beta/models" +
-      "?key=" +
-      encodeURIComponent(
-        process.env.GEMINI_API_KEY
-      );
-
-    const response = await fetch(url);
-
-    result.gemini.status = response.status;
-    result.gemini.ok = response.ok;
-
-    if (!response.ok) {
-      const body = await response.text();
-
-      result.gemini.error =
-        body.slice(0, 300);
-    }
-
-  } catch (error) {
-
-    result.gemini.ok = false;
-    result.gemini.error = error.message;
-  }
-
-
-  result.elevenlabs.configured =
-    result.environment.elevenLabsKey &&
-    result.environment.adMale &&
-    result.environment.adFemale &&
-    result.environment.jingleMale &&
-    result.environment.jingleFemale;
-
-
-  result.ok =
-    result.gemini.ok &&
-    result.elevenlabs.configured;
-
-
-  res.status(200).json(result);
-});
-
-
-// ============================================================
-// TESTE REAL ELEVENLABS
-// GERA MP3 USANDO A VOZ MASCULINA DOS ANÚNCIOS
-// ============================================================
-
-app.get("/api/test-voice", async (req, res) => {
-
-  try {
-
-    const apiKey =
-      process.env.ELEVENLABS_API_KEY;
-
-    const voiceId =
-      process.env.ELEVENLABS_VOICE_MALE_ID;
-
-
-    if (!apiKey) {
-      return res.status(500).json({
-        ok: false,
-        error:
-          "ELEVENLABS_API_KEY não configurada"
-      });
-    }
-
-
-    if (!voiceId) {
-      return res.status(500).json({
-        ok: false,
-        error:
-          "ELEVENLABS_VOICE_MALE_ID não configurado"
-      });
-    }
-
-
-    const response = await fetch(
-      `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}`,
-      {
-        method: "POST",
-
-        headers: {
-          "xi-api-key": apiKey,
-          "Content-Type": "application/json",
-          "Accept": "audio/mpeg"
-        },
-
-        body: JSON.stringify({
-          text:
-            "teste de voz da capivara rádio.",
-
-          model_id:
-            "eleven_multilingual_v2"
-        })
-      }
-    );
-
-
-    if (!response.ok) {
-
-      const errorBody =
-        await response.text();
-
-      return res
-        .status(response.status)
-        .json({
-          ok: false,
-          status: response.status,
-          error:
-            errorBody.slice(0, 500)
-        });
-    }
-
-
-    const audio =
-      Buffer.from(
-        await response.arrayBuffer()
-      );
-
-
-    res.setHeader(
-      "Content-Type",
-      "audio/mpeg"
-    );
-
-    res.setHeader(
-      "Content-Disposition",
-      'inline; filename="teste-capivara.mp3"'
-    );
-
-    res.setHeader(
-      "Cache-Control",
-      "no-store"
-    );
-
-    res.send(audio);
-
-  } catch (error) {
-
-    res.status(500).json({
-      ok: false,
-      error: error.message
-    });
-  }
-});
-
-
-// ============================================================
-// CONFIGURAÇÃO PÚBLICA
-// ============================================================
-
-app.get("/api/public/config", (req, res) => {
-
-  const settings =
-    read().settings || {};
+app.get("/health", safe(async (req, res) => {
+  await pool.query("SELECT 1");
 
   res.json({
     ok: true,
+    database: "postgres",
+    time: new Date().toISOString()
+  });
+}));
 
+app.get("/api/environment-status", safe(async (req, res) => {
+  const data = await readData();
+  const settings = data.settings || {};
+
+  const textKeys =
+    settings.apiPool?.text?.some(x => x.enabled && x.key) ||
+    !!process.env.GEMINI_API_KEY;
+
+  const voiceKeys =
+    settings.apiPool?.voice?.some(x => x.enabled && x.key) ||
+    !!process.env.ELEVENLABS_API_KEY;
+
+  res.json({
+    ok: true,
+    database: true,
+    databaseType: "postgres",
+    gemini: !!textKeys,
+    elevenlabs: !!voiceKeys
+  });
+}));
+
+/* =========================================================
+   CONFIGURAÇÃO PÚBLICA DO PLAYER
+========================================================= */
+
+app.get("/api/public/config", safe(async (req, res) => {
+  const data = await readData();
+  const settings = data.settings || {};
+
+  res.json({
+    ok: true,
     settings: {
-
-      aiMode:
-        settings.aiMode ||
-        "hybrid",
+      aiMode: settings.aiMode || "hybrid",
 
       voxUrl:
         settings.voxUrl ||
         "https://capivara-vox-ai.onrender.com/generate",
 
       geminiModel:
-        settings.geminiModel || "",
+        settings.geminiModel ||
+        "gemini-2.5-flash",
 
       adsPerBlock:
         settings.adsPerBlock ?? 3,
@@ -386,345 +187,391 @@ app.get("/api/public/config", (req, res) => {
         settings.useJingles ?? true
     }
   });
-});
+}));
 
+/* =========================================================
+   CLIENTE
+========================================================= */
 
-// ============================================================
-// CLIENTE - DADOS
-// ============================================================
-
-app.get("/api/client/:code", (req, res) => {
-
-  const database = read();
-
-  const clientCode =
-    code(req.params.code);
+app.get("/api/client/:code", safe(async (req, res) => {
+  const data = await readData();
 
   const client =
-    database.clients?.[clientCode];
-
+    data.clients?.[cleanCode(req.params.code)];
 
   if (!client) {
-
     return res.status(404).json({
       ok: false,
       error: "cliente não encontrado"
     });
   }
 
-
   if (client.active === false) {
-
     return res.status(403).json({
       ok: false,
       error: "cliente bloqueado"
     });
   }
 
-
   const {
     secrets,
-    ...safeClient
+    ...publicClient
   } = client;
 
+  res.json({
+    ok: true,
+    client: publicClient
+  });
+}));
+
+/* =========================================================
+   CONFIGURAÇÕES DO ADM
+========================================================= */
+
+app.get("/api/admin/settings", safe(async (req, res) => {
+  const data = await readData();
 
   res.json({
     ok: true,
-    client: safeClient
+    settings: data.settings || {}
   });
-});
+}));
 
+app.put("/api/admin/settings", safe(async (req, res) => {
+  const data = await readData();
 
-// ============================================================
-// CONFIGURAÇÕES ADM
-// ============================================================
-
-app.get("/api/admin/settings", (req, res) => {
-
-  res.json({
-    ok: true,
-    settings:
-      read().settings || {}
-  });
-});
-
-
-app.put("/api/admin/settings", (req, res) => {
-
-  const database = read();
-
-  database.settings = {
-    ...(database.settings || {}),
+  data.settings = {
+    ...(data.settings || {}),
     ...(req.body || {})
   };
 
-  write(database);
+  await writeData(data);
 
   res.json({
     ok: true,
-    settings:
-      database.settings
+    settings: data.settings
   });
-});
+}));
 
+/* =========================================================
+   CLIENTES DO ADM
+========================================================= */
 
-// ============================================================
-// CLIENTES ADM
-// ============================================================
-
-app.get("/api/admin/clients", (req, res) => {
-
-  const database = read();
+app.get("/api/admin/clients", safe(async (req, res) => {
+  const data = await readData();
 
   res.json({
     ok: true,
-    clients:
-      Object.values(
-        database.clients || {}
-      )
+    clients: Object.values(data.clients || {})
   });
-});
+}));
 
+async function saveClient(req, res) {
+  const body = req.body || {};
 
-app.post("/api/admin/client", (req, res) => {
+  const clientCode = cleanCode(
+    req.params?.code ||
+    body.code ||
+    body.codigo
+  );
 
-  const database = read();
-
-  const client =
-    req.body || {};
-
-  client.code =
-    code(client.code);
-
-
-  if (!client.code) {
-
+  if (!clientCode) {
     return res.status(400).json({
       ok: false,
       error: "código inválido"
     });
   }
 
+  const data = await readData();
 
-  database.clients[client.code] = {
-    ...(database.clients[client.code] || {}),
-    ...client,
-    code: client.code
+  data.clients ||= {};
+
+  data.clients[clientCode] = {
+    ...(data.clients[clientCode] || {}),
+    ...body,
+    code: clientCode
   };
 
-
-  write(database);
-
+  await writeData(data);
 
   res.json({
     ok: true,
-    client:
-      database.clients[client.code]
+    client: data.clients[clientCode]
   });
-});
+}
 
+app.post(
+  "/api/admin/client",
+  safe(saveClient)
+);
 
-app.delete("/api/admin/client/:code", (req, res) => {
+app.put(
+  "/api/admin/client/:code",
+  safe(saveClient)
+);
 
-  const database = read();
+app.delete(
+  "/api/admin/client/:code",
+  safe(async (req, res) => {
 
-  const clientCode =
-    code(req.params.code);
+    const data = await readData();
 
-  delete database.clients[clientCode];
+    const clientCode =
+      cleanCode(req.params.code);
 
-  write(database);
+    if (data.clients) {
+      delete data.clients[clientCode];
+    }
 
-  res.json({
-    ok: true
-  });
-});
+    await writeData(data);
 
-
-// ============================================================
-// ESTADO INDIVIDUAL DE CADA CLIENTE
-// ============================================================
-
-app.get("/api/client/:code/state", (req, res) => {
-
-  const database = read();
-
-  const clientCode =
-    code(req.params.code);
-
-  const client =
-    database.clients?.[clientCode];
-
-
-  if (!client) {
-
-    return res.status(404).json({
-      ok: false,
-      error: "cliente não encontrado"
+    res.json({
+      ok: true
     });
-  }
+  })
+);
 
+/* =========================================================
+   ESTADO INDIVIDUAL DE CADA RÁDIO
+========================================================= */
 
-  res.json({
-    ok: true,
+app.get(
+  "/api/client/:code/state",
+  safe(async (req, res) => {
 
-    state:
-      client.state || {
-        ads: [],
-        queue: [],
-        counters: {},
-        voiceTurn: 0
-      }
-  });
-});
+    const data = await readData();
 
+    const client =
+      data.clients?.[
+        cleanCode(req.params.code)
+      ];
 
-app.put("/api/client/:code/state", (req, res) => {
+    if (!client) {
+      return res.status(404).json({
+        ok: false,
+        error: "cliente não encontrado"
+      });
+    }
 
-  const database = read();
+    res.json({
+      ok: true,
 
-  const clientCode =
-    code(req.params.code);
-
-
-  if (!database.clients[clientCode]) {
-
-    return res.status(404).json({
-      ok: false,
-      error: "cliente não encontrado"
+      state:
+        client.state || {
+          ads: [],
+          queue: [],
+          counters: {},
+          voiceTurn: 0
+        }
     });
-  }
+  })
+);
 
+app.put(
+  "/api/client/:code/state",
+  safe(async (req, res) => {
 
-  database.clients[clientCode].state =
-    req.body || {};
+    const clientCode =
+      cleanCode(req.params.code);
 
+    const data =
+      await readData();
 
-  write(database);
+    if (!data.clients?.[clientCode]) {
+      return res.status(404).json({
+        ok: false,
+        error: "cliente não encontrado"
+      });
+    }
 
+    data.clients[clientCode].state =
+      req.body || {};
 
-  res.json({
-    ok: true
-  });
-});
+    await writeData(data);
 
+    res.json({
+      ok: true
+    });
+  })
+);
 
-// ============================================================
-// PLAYLISTS
-// ============================================================
+/* =========================================================
+   PLAYLISTS / VINHETAS / FUNDOS
+========================================================= */
 
-app.get("/api/playlists", (req, res) => {
+for (const key of [
+  "playlists",
+  "jingles",
+  "backgrounds"
+]) {
 
-  const database = read();
+  app.get(
+    `/api/${key}`,
+    safe(async (req, res) => {
 
-  res.json({
-    ok: true,
-    playlists:
-      database.playlists || {}
-  });
-});
+      const data =
+        await readData();
 
+      res.json({
+        ok: true,
+        [key]: data[key] || {}
+      });
+    })
+  );
 
-app.put("/api/admin/playlists", (req, res) => {
+  app.put(
+    `/api/admin/${key}`,
+    safe(async (req, res) => {
 
-  const database = read();
+      const data =
+        await readData();
 
-  database.playlists =
-    req.body || {};
+      data[key] =
+        req.body || {};
 
-  write(database);
+      await writeData(data);
 
-  res.json({
-    ok: true
-  });
-});
+      res.json({
+        ok: true
+      });
+    })
+  );
+}
 
+/* =========================================================
+   TESTE DAS CHAVES
+========================================================= */
 
-// ============================================================
-// VINHETAS
-// ============================================================
+app.get(
+  "/api/test-apis",
+  safe(async (req, res) => {
 
-app.get("/api/jingles", (req, res) => {
+    const data =
+      await readData();
 
-  const database = read();
+    const settings =
+      data.settings || {};
 
-  res.json({
-    ok: true,
-    jingles:
-      database.jingles || {}
-  });
-});
+    res.json({
+      ok: true,
 
+      textKeys:
+        (
+          settings.apiPool?.text || []
+        ).filter(
+          x => x.enabled && x.key
+        ).length,
 
-app.put("/api/admin/jingles", (req, res) => {
+      voiceKeys:
+        (
+          settings.apiPool?.voice || []
+        ).filter(
+          x => x.enabled && x.key
+        ).length
+    });
+  })
+);
 
-  const database = read();
+/* =========================================================
+   TESTE ELEVENLABS
+========================================================= */
 
-  database.jingles =
-    req.body || {};
+app.post(
+  "/api/test-voice",
+  safe(async (req, res) => {
 
-  write(database);
+    const data =
+      await readData();
 
-  res.json({
-    ok: true
-  });
-});
+    const settings =
+      data.settings || {};
 
+    const keys =
+      (
+        settings.apiPool?.voice || []
+      ).filter(
+        x => x.enabled && x.key
+      );
 
-// ============================================================
-// FUNDOS DE LOCUÇÃO
-// ============================================================
+    const apiKey =
+      keys[0]?.key ||
+      process.env.ELEVENLABS_API_KEY;
 
-app.get("/api/backgrounds", (req, res) => {
+    const voiceId =
+      req.body?.voiceId ||
+      settings.voices?.adMale ||
+      process.env.ELEVENLABS_VOICE_MALE_ID;
 
-  const database = read();
+    if (!apiKey || !voiceId) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "chave/voice ID não configurados"
+      });
+    }
 
-  res.json({
-    ok: true,
-    backgrounds:
-      database.backgrounds || {}
-  });
-});
+    const response =
+      await fetch(
+        `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}`,
+        {
+          method: "POST",
 
+          headers: {
+            "xi-api-key": apiKey,
+            "Content-Type":
+              "application/json",
+            "Accept":
+              "audio/mpeg"
+          },
 
-app.put("/api/admin/backgrounds", (req, res) => {
+          body: JSON.stringify({
+            text:
+              req.body?.text ||
+              "teste de voz capivara rádio",
 
-  const database = read();
+            model_id:
+              "eleven_multilingual_v2"
+          })
+        }
+      );
 
-  database.backgrounds =
-    req.body || {};
+    if (!response.ok) {
+      return res
+        .status(response.status)
+        .json({
+          ok: false,
+          error:
+            await response.text()
+        });
+    }
 
-  write(database);
+    const buffer =
+      Buffer.from(
+        await response.arrayBuffer()
+      );
 
-  res.json({
-    ok: true
-  });
-});
+    res.setHeader(
+      "Content-Type",
+      "audio/mpeg"
+    );
 
+    res.send(buffer);
+  })
+);
 
-// ============================================================
-// ERRO 404
-// ============================================================
+/* =========================================================
+   INICIALIZAÇÃO
+========================================================= */
 
-app.use((req, res) => {
-
-  res.status(404).json({
-    ok: false,
-    error: "rota não encontrada"
-  });
-});
-
-
-// ============================================================
-// INICIAR SERVIDOR
-// ============================================================
+await initDb();
 
 app.listen(
   PORT,
   "0.0.0.0",
   () => {
     console.log(
-      `Capivara Radio Server ativo ${PORT}`
+      "Capivara Radio Server V2 + Postgres ativo",
+      PORT
     );
   }
 );
