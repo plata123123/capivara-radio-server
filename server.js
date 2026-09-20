@@ -1,267 +1,305 @@
-async function callGeminiWithFallback({
-  prompt,
-  model
-}) {
+async function callGeminiWithFallback({ prompt, model }) {
   const data = await readData();
   const settings = data.settings || {};
 
-  const keys = activeKeys(
-    settings.apiPool?.text
-  );
+  const keys = activeKeys(settings.apiPool?.text);
 
   if (
     keys.length === 0 &&
     process.env.GEMINI_API_KEY
   ) {
-    keys.push(
-      process.env.GEMINI_API_KEY
-    );
+    keys.push(process.env.GEMINI_API_KEY);
   }
 
   if (!keys.length) {
-    throw new Error(
-      "nenhuma chave Gemini ativa"
-    );
+    throw new Error("nenhuma chave Gemini ativa");
   }
-
-  /*
-    CORREÇÃO GEMINI 404
-
-    Ordem:
-    1. tenta o modelo pedido pelo Player
-    2. tenta o modelo configurado no ADM
-    3. tenta automaticamente modelos de fallback
-
-    Se um modelo não existir para aquela chave/API e retornar
-    400 ou 404, o servidor passa para o próximo modelo.
-  */
-
-  const models = [
-    model,
-    settings.geminiModel,
-    "gemini-3.8-flash",
-    "gemini-3.6-flash",
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite"
-  ]
-    .map(value =>
-      String(value || "").trim()
-    )
-    .filter(
-      (value, index, array) =>
-        value &&
-        array.indexOf(value) === index
-    );
 
   let lastError = null;
 
-  for (
-    let keyIndex = 0;
-    keyIndex < keys.length;
-    keyIndex++
-  ) {
-
+  for (let keyIndex = 0; keyIndex < keys.length; keyIndex++) {
     const apiKey = keys[keyIndex];
 
-    for (
-      let modelIndex = 0;
-      modelIndex < models.length;
-      modelIndex++
-    ) {
+    try {
+      /* ==========================================
+         1. PERGUNTA AO GOOGLE QUAIS MODELOS
+            ESTA CHAVE REALMENTE PODE USAR
+      ========================================== */
 
-      const currentModel =
-        models[modelIndex];
+      const listResponse = await fetch(
+        "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000",
+        {
+          method: "GET",
+          headers: {
+            "x-goog-api-key": apiKey
+          }
+        }
+      );
+
+      const listRaw = await listResponse.text();
+
+      let listJson = {};
 
       try {
+        listJson = listRaw
+          ? JSON.parse(listRaw)
+          : {};
+      } catch {
+        listJson = {};
+      }
 
-        const url =
-          "https://generativelanguage.googleapis.com/v1beta/models/" +
-          encodeURIComponent(currentModel) +
-          ":generateContent";
+      if (!listResponse.ok) {
+        const detail =
+          listJson?.error?.message ||
+          listRaw ||
+          `HTTP ${listResponse.status}`;
 
-        const response =
-          await fetch(
-            url,
-            {
-              method: "POST",
+        lastError = new Error(
+          `Gemini chave ${keyIndex + 1}: HTTP ${listResponse.status} - ${detail}`
+        );
 
-              headers: {
-                "Content-Type":
-                  "application/json",
+        console.warn(lastError.message);
 
-                /*
-                  A chave agora vai no header oficial
-                  recomendado pela API Gemini.
-                */
-                "x-goog-api-key":
-                  apiKey
-              },
+        // passa automaticamente para a próxima chave
+        continue;
+      }
 
-              body: JSON.stringify({
-                contents: [
-                  {
-                    role: "user",
+      /* ==========================================
+         2. PEGA SOMENTE MODELOS QUE SUPORTAM
+            generateContent
+      ========================================== */
 
-                    parts: [
-                      {
-                        text: prompt
-                      }
-                    ]
-                  }
-                ],
+      const availableModels = Array.isArray(listJson.models)
+        ? listJson.models
+        : [];
 
-                generationConfig: {
-                  maxOutputTokens: 120
-                }
-              })
-            }
-          );
+      let usableModels = availableModels
+        .filter(item => {
+          const methods =
+            item?.supportedGenerationMethods || [];
 
-        /*
-          Lemos a resposta mesmo quando ocorre erro.
-          Assim o servidor consegue identificar
-          corretamente 400, 404, 429 etc.
-        */
+          return methods.includes("generateContent");
+        })
+        .map(item => {
+          /*
+            Google devolve:
+            models/gemini-xxxx
 
-        const raw =
-          await response.text();
+            O endpoint de geração também aceita
+            exatamente esse recurso.
+          */
+          return String(item?.name || "").trim();
+        })
+        .filter(Boolean);
 
-        let json = {};
+      /*
+        Preferimos modelos Gemini de texto.
+        Evita escolher modelos de embedding,
+        imagem etc.
+      */
 
-        try {
-          json =
-            raw
-              ? JSON.parse(raw)
-              : {};
-        } catch {
-          json = {};
+      usableModels = usableModels.filter(name =>
+        name.toLowerCase().includes("gemini")
+      );
+
+      if (!usableModels.length) {
+        lastError = new Error(
+          `Gemini chave ${keyIndex + 1}: nenhum modelo com generateContent disponível`
+        );
+
+        console.warn(lastError.message);
+        continue;
+      }
+
+      /* ==========================================
+         3. ORGANIZA PREFERÊNCIA
+
+         Se o modelo pedido pelo Player/ADM existir
+         para ESTA chave, ele vai primeiro.
+
+         Depois preferimos modelos Flash disponíveis.
+
+         Não inventamos nenhum nome.
+      ========================================== */
+
+      const requestedModel = String(
+        model ||
+        settings.geminiModel ||
+        ""
+      )
+        .trim()
+        .replace(/^models\//, "");
+
+      usableModels.sort((a, b) => {
+        const cleanA =
+          a.replace(/^models\//, "");
+
+        const cleanB =
+          b.replace(/^models\//, "");
+
+        if (
+          requestedModel &&
+          cleanA === requestedModel
+        ) {
+          return -1;
         }
 
-        /*
-          MODELO / REQUISIÇÃO NÃO DISPONÍVEL
+        if (
+          requestedModel &&
+          cleanB === requestedModel
+        ) {
+          return 1;
+        }
 
-          400 ou 404:
-          não derruba a geração.
-          tenta automaticamente o próximo modelo.
+        const aFlash =
+          cleanA.toLowerCase().includes("flash");
+
+        const bFlash =
+          cleanB.toLowerCase().includes("flash");
+
+        if (aFlash && !bFlash) return -1;
+        if (!aFlash && bFlash) return 1;
+
+        /*
+          Evita experimental/preview quando há
+          opção normal disponível.
         */
 
-        if (!response.ok) {
+        const aPreview =
+          /preview|exp|experimental/i.test(cleanA);
 
-          const detail =
-            json?.error?.message ||
-            raw ||
-            `HTTP ${response.status}`;
+        const bPreview =
+          /preview|exp|experimental/i.test(cleanB);
 
-          lastError =
-            new Error(
-              `Gemini chave ${
-                keyIndex + 1
-              }, modelo ${
-                currentModel
-              }: HTTP ${
-                response.status
-              } - ${detail}`
+        if (!aPreview && bPreview) return -1;
+        if (aPreview && !bPreview) return 1;
+
+        return 0;
+      });
+
+      /* ==========================================
+         4. TESTA SOMENTE MODELOS QUE O PRÓPRIO
+            GOOGLE DISSE ESTAREM DISPONÍVEIS
+      ========================================== */
+
+      for (const modelResource of usableModels) {
+        try {
+          const cleanModel =
+            modelResource.replace(/^models\//, "");
+
+          const url =
+            "https://generativelanguage.googleapis.com/v1beta/models/" +
+            encodeURIComponent(cleanModel) +
+            ":generateContent";
+
+          const response = await fetch(url, {
+            method: "POST",
+
+            headers: {
+              "Content-Type": "application/json",
+              "x-goog-api-key": apiKey
+            },
+
+            body: JSON.stringify({
+              contents: [
+                {
+                  role: "user",
+                  parts: [
+                    {
+                      text: prompt
+                    }
+                  ]
+                }
+              ],
+
+              generationConfig: {
+                maxOutputTokens: 120
+              }
+            })
+          });
+
+          const raw = await response.text();
+
+          let json = {};
+
+          try {
+            json = raw
+              ? JSON.parse(raw)
+              : {};
+          } catch {
+            json = {};
+          }
+
+          if (!response.ok) {
+            const detail =
+              json?.error?.message ||
+              raw ||
+              `HTTP ${response.status}`;
+
+            lastError = new Error(
+              `Gemini chave ${keyIndex + 1}, modelo ${cleanModel}: HTTP ${response.status} - ${detail}`
             );
 
-          console.warn(
-            lastError.message
-          );
+            console.warn(lastError.message);
 
-          if (
-            response.status === 400 ||
-            response.status === 404
-          ) {
-
-            console.log(
-              `Tentando próximo modelo Gemini...`
-            );
-
+            /*
+              Se este modelo não funcionar,
+              simplesmente testa o próximo que
+              o próprio Google listou.
+            */
             continue;
           }
 
-          /*
-            Problema de chave, limite ou servidor:
-            401
-            403
-            429
-            5xx
-
-            Nesse caso passa para a próxima chave.
-          */
-
-          break;
-        }
-
-        /*
-          RESPOSTA GEMINI
-        */
-
-        const text =
-          json
+          const text = json
             ?.candidates?.[0]
             ?.content?.parts
-            ?.map(
-              part =>
-                part.text || ""
-            )
+            ?.map(part => part?.text || "")
             .join("")
             .trim();
 
-        if (!text) {
-
-          lastError =
-            new Error(
-              `Gemini chave ${
-                keyIndex + 1
-              }, modelo ${
-                currentModel
-              }: resposta vazia`
+          if (!text) {
+            lastError = new Error(
+              `Gemini chave ${keyIndex + 1}, modelo ${cleanModel}: resposta vazia`
             );
 
-          console.warn(
-            lastError.message
+            console.warn(lastError.message);
+            continue;
+          }
+
+          console.log(
+            `Gemini OK | chave ${keyIndex + 1} | modelo ${cleanModel}`
           );
 
-          continue;
+          return {
+            text,
+            keySlot: keyIndex + 1,
+            model: cleanModel
+          };
+
+        } catch (error) {
+          lastError = error;
+
+          console.error(
+            "Erro ao testar modelo Gemini:",
+            error?.message || error
+          );
         }
-
-        /*
-          SUCESSO
-        */
-
-        console.log(
-          `Gemini OK | chave ${
-            keyIndex + 1
-          } | modelo ${currentModel}`
-        );
-
-        return {
-          text,
-          keySlot:
-            keyIndex + 1,
-
-          model:
-            currentModel
-        };
-
-      } catch (error) {
-
-        lastError =
-          error;
-
-        console.error(
-          "Erro Gemini:",
-          error?.message ||
-          error
-        );
       }
+
+    } catch (error) {
+      lastError = error;
+
+      console.error(
+        `Erro Gemini chave ${keyIndex + 1}:`,
+        error?.message || error
+      );
     }
   }
 
   throw (
     lastError ||
     new Error(
-      "todas as chaves/modelos Gemini falharam"
+      "nenhuma chave/modelo Gemini conseguiu gerar o anúncio"
     )
   );
 }
